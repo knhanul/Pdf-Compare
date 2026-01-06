@@ -1,0 +1,385 @@
+import sys
+import fitz  # PyMuPDF
+import re
+import traceback
+import os
+from datetime import datetime
+from difflib import SequenceMatcher
+
+# Get version and date from environment variables (set by build script)
+VERSION = os.environ.get('PDF_COMPARE_VERSION', '1.1.3') 
+RELEASE_DATE = os.environ.get('PDF_COMPARE_RELEASE_DATE', '2025-12-31')
+DEVELOPER = '¿ìÃ¼±¹±ÝÀ¶°³¹ß¿ø µðÁöÅÐÁ¤º¸Àü·«½Ç ½Ã½ºÅÛÇ°ÁúÆÀ'
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QPushButton, QLabel, QFileDialog, QScrollArea, QMessageBox, QTextEdit,
+    QDialog, QFrame, QGraphicsOpacityEffect
+)
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QIcon, QFont
+from PyQt6.QtCore import Qt, QRect, QTimer, QSize, QPropertyAnimation, QEasingCurve
+
+# Custom colors for highlighting
+COLOR_P1 = QColor(255, 255, 0, 120)   # Fluorescent Yellow (PDF1)
+COLOR_P2 = QColor(0, 255, 127, 130)  # Fluorescent Emerald (PDF2)
+COLOR_AREA = QColor(0, 120, 255, 15) # Recent selection area
+COLOR_MAIN_BLUE = "#004b93"
+COLOR_COMPARE_BTN = "#FF6D00"        # Orange
+COLOR_INFO_BTN = "#FFEB3B"           # Yellow
+
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+class ViewComparisonTextDialog(QDialog):
+    """Dialog to check extracted normalization text"""
+    def __init__(self, left_text, right_text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ºñ±³ ´ë»ó ÅØ½ºÆ® µ¥ÀÌÅÍ È®ÀÎ")
+        self.resize(900, 700)
+        layout = QVBoxLayout(self)
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(QFont("Consolas", 10))
+        
+        def format_text(txt):
+            if not txt: return "<i style='color:red;'>µ¥ÀÌÅÍ°¡ ¾ø½À´Ï´Ù.</i>"
+            return txt.replace('\n', '<br>')
+
+        content = f"<h3>?? ÃßÃâ ¿£Áø Ã³¸® µ¥ÀÌÅÍ (v{VERSION})</h3><hr>"
+        content += "<h4>?? [PDF 1]</h4>"
+        content += f"<div style='background:#f9f9f9; padding:15px; border:1px solid #ddd; border-radius:5px;'>{format_text(left_text)}</div><hr>"
+        content += "<h4>?? [PDF 2]</h4>"
+        content += f"<div style='background:#f9f9f9; padding:15px; border:1px solid #ddd; border-radius:5px;'>{format_text(right_text)}</div>"
+        
+        self.text_edit.setHtml(content)
+        layout.addWidget(self.text_edit)
+        
+        btn_layout = QHBoxLayout()
+        copy_btn = QPushButton("?? ÀüÃ¼ º¹»ç")
+        copy_btn.clicked.connect(lambda: [QApplication.clipboard().setText(self.text_edit.toPlainText()), QMessageBox.information(self, "¼º°ø", "º¹»çµÇ¾ú½À´Ï´Ù.")])
+        close_btn = QPushButton("´Ý±â")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(copy_btn); btn_layout.addStretch(); btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+class LoadingOverlay(QWidget):
+    """Overlay for waiting screens"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.opacity_effect)
+        self.icon_opacity = QGraphicsOpacityEffect(self)
+
+        layout = QVBoxLayout(self)
+        self.bg_frame = QFrame()
+        self.bg_frame.setStyleSheet("background-color: rgba(255, 255, 255, 140); border-radius: 40px;")
+        
+        f_layout = QVBoxLayout(self.bg_frame)
+        self.icon_label = QLabel()
+        self.icon_label.setGraphicsEffect(self.icon_opacity)
+        
+        logo_path = get_resource_path('posid_logo.png')
+        if os.path.exists(logo_path):
+            self.icon_label.setPixmap(QPixmap(logo_path).scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.icon_label.setText("?")
+            self.icon_label.setStyleSheet("font-size: 50px; color: #004b93;")
+        self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.msg = QLabel("Ã³¸® Áß...")
+        self.msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.msg.setStyleSheet("font-size: 14px; font-weight: bold; color: #444;")
+        
+        f_layout.addStretch(); f_layout.addWidget(self.icon_label); f_layout.addWidget(self.msg); f_layout.addStretch()
+        layout.addStretch(); layout.addWidget(self.bg_frame, 0, Qt.AlignmentFlag.AlignCenter); layout.addStretch()
+        self.hide()
+
+    def start_animation(self, message="Ã³¸® Áß...", faded_icon=False):
+        self.msg.setText(f"<b>{message}</b>")
+        self.icon_opacity.setOpacity(0.25 if faded_icon else 0.6) 
+        self.show(); self.setGeometry(self.parent().rect())
+        self.anim = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.anim.setDuration(350); self.anim.setStartValue(0.0); self.anim.setEndValue(1.0)
+        self.anim.setEasingCurve(QEasingCurve.Type.OutCubic); self.anim.start()
+
+    def stop_animation(self):
+        self.hide(); self.opacity_effect.setOpacity(0.0)
+
+class SelectableLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selection_start = None; self.selection_end = None
+        self.is_selecting = False; self.page_num = -1
+        
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selection_start = event.pos(); self.selection_end = event.pos()
+            self.is_selecting = True; self.update()
+            
+    def mouseMoveEvent(self, event):
+        if self.is_selecting:
+            self.selection_end = event.pos(); self.update()
+            
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.is_selecting:
+            self.is_selecting = False
+            parent = self.parent()
+            while parent and not isinstance(parent, PDFViewer): parent = parent.parent()
+            if parent: parent.on_selection_complete(self.page_num, QRect(self.selection_start, self.selection_end).normalized())
+            self.update()
+                
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.selection_start and self.selection_end:
+            painter = QPainter(self)
+            painter.setBrush(QColor(0, 120, 255, 60))
+            painter.setPen(QPen(QColor(0, 0, 255), 2, Qt.PenStyle.DashLine))
+            rect = QRect(self.selection_start, self.selection_end).normalized()
+            painter.drawRect(rect)
+            painter.end()
+
+    def clear_selection(self):
+        self.selection_start = None; self.selection_end = None; self.update()
+
+class PDFViewer(QScrollArea):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.container = QWidget(); self.vbox = QVBoxLayout(self.container)
+        self.vbox.setContentsMargins(0, 0, 0, 0); self.setWidget(self.container)
+        self.pdf_doc = None; self.page_labels = []; self.scale = 1.5
+        self.char_data = []; self.word_highlights = {}; self.last_compared_area = {}; self.pending_selection_rect = None
+
+    def load_pdf(self, path):
+        try:
+            self.pdf_doc = fitz.open(path); self.reload_pages(); return True
+        except: return False
+
+    def reload_pages(self):
+        if not self.pdf_doc: return
+        for lbl in self.page_labels: lbl.setParent(None)
+        self.page_labels.clear()
+        for i in range(len(self.pdf_doc)):
+            page = self.pdf_doc.load_page(i)
+            pix = page.get_pixmap(matrix=fitz.Matrix(self.scale, self.scale))
+            img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+            lbl = SelectableLabel(self.container); lbl.page_num = i
+            lbl.setPixmap(QPixmap.fromImage(img.copy()))
+            self.vbox.addWidget(lbl); self.page_labels.append(lbl)
+        self.refresh_highlights()
+
+    def refresh_highlights(self):
+        for i, lbl in enumerate(self.page_labels):
+            img = lbl.pixmap().toImage()
+            painter = QPainter(img)
+            if i in self.last_compared_area:
+                for bbox in self.last_compared_area[i]:
+                    r = QRect(int(bbox[0]*self.scale), int(bbox[1]*self.scale), int((bbox[2]-bbox[0])*self.scale), int((bbox[3]-bbox[1])*self.scale))
+                    painter.fillRect(r, COLOR_AREA)
+            if i in self.word_highlights:
+                for bbox, color in self.word_highlights[i]:
+                    if bbox:
+                        r = QRect(int(bbox[0]*self.scale), int(bbox[1]*self.scale), int((bbox[2]-bbox[0])*self.scale), int((bbox[3]-bbox[1])*self.scale))
+                        painter.fillRect(r, color)
+            painter.end(); lbl.setPixmap(QPixmap.fromImage(img))
+
+    def on_selection_complete(self, page_num, rect):
+        if rect.width() < 5: return
+        x0, y0, x1, y1 = rect.x()/self.scale, rect.y()/self.scale, (rect.x()+rect.width())/self.scale, (rect.y()+rect.height())/self.scale
+        self.pending_selection_rect = (page_num, fitz.Rect(x0, y0, x1, y1))
+        self.char_data = [] 
+        self.extract_and_process_text(page_num, rect)
+
+    def extract_and_process_text(self, page_num, rect):
+        x0, y0, x1, y1 = rect.x()/self.scale, rect.y()/self.scale, (rect.x()+rect.width())/self.scale, (rect.y()+rect.height())/self.scale
+        fitz_rect = fitz.Rect(x0, y0, x1, y1); page = self.pdf_doc.load_page(page_num); raw_dict = page.get_text("rawdict", clip=fitz_rect)
+        all_raw_chars = []
+        for block in raw_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    for char in span.get("chars", []):
+                        c = char['c']
+                        if '°¡' <= c <= 'ÆR' or '¤¡' <= c <= '¤¾' or c.isdigit() or ('a' <= c.lower() <= 'z') or c == ' ':
+                            all_raw_chars.append({
+                                'char': c.lower() if 'a' <= c.lower() <= 'z' else c, 
+                                'bbox': char['bbox'], 
+                                'y': char['bbox'][1], 
+                                'x': char['bbox'][0]
+                            })
+        if not all_raw_chars: return
+        all_raw_chars.sort(key=lambda x: x['y'])
+        grouped = []
+        if all_raw_chars:
+            curr = [all_raw_chars[0]]
+            for i in range(1, len(all_raw_chars)):
+                if all_raw_chars[i]['y'] - curr[-1]['y'] < 5.0: curr.append(all_raw_chars[i])
+                else: grouped.append(curr); curr = [all_raw_chars[i]]
+            grouped.append(curr)
+        
+        final = []
+        for line in grouped:
+            line.sort(key=lambda x: x['x'])
+            for c in line:
+                if c['char'].strip() == "": continue
+                if not final or not (c['char'] == final[-1]['char'] and abs(c['x'] - final[-1]['x']) < 2.5):
+                    final.append(c)
+        
+        self.char_data = [{'char': item['char'], 'bbox': item['bbox'], 'page': page_num} for item in final]
+
+    def zoom_in(self): self.scale *= 1.2; self.reload_pages()
+    def zoom_out(self): self.scale /= 1.2; self.reload_pages()
+    def clear_all_data(self):
+        self.word_highlights.clear(); self.last_compared_area.clear(); self.char_data.clear(); self.pending_selection_rect = None
+        for lbl in self.page_labels: lbl.clear_selection()
+        self.reload_pages()
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"PDF ÅØ½ºÆ® ºñ±³ v{VERSION}")
+        self.setGeometry(100, 100, 1600, 950)
+        
+        # Load Icon for taskbar and titlebar
+        ico_path = get_resource_path('posid_logo.ico')
+        if os.path.exists(ico_path):
+            self.setWindowIcon(QIcon(ico_path))
+        
+        main_widget = QWidget(); self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget); layout.setSpacing(5)
+        
+        top_bar = QHBoxLayout()
+        self.btn_load1 = QPushButton("?? PDF 1 ¿­±â"); self.btn_load2 = QPushButton("?? PDF 2 ¿­±â")
+        btn_style = f"background:{COLOR_MAIN_BLUE}; color:white; font-weight:bold; height:36px; padding:0 15px; border-radius:4px;"
+        self.btn_load1.setStyleSheet(btn_style); self.btn_load2.setStyleSheet(btn_style)
+        top_bar.addWidget(self.btn_load1); top_bar.addWidget(self.btn_load2); top_bar.addStretch()
+        
+        self.btn_compare = QPushButton("?? ºñ±³ ½ÇÇà")
+        self.btn_compare.setStyleSheet(f"background-color:{COLOR_COMPARE_BTN}; color:white; font-weight:bold; font-size:15px; height:42px; width:350px; border-radius:6px;")
+        top_bar.addWidget(self.btn_compare); top_bar.addStretch()
+        
+        self.btn_view_text = QPushButton("?? ÃßÃâ µ¥ÀÌÅÍ È®ÀÎ"); self.btn_reset = QPushButton("ºñ±³°á°úÃÊ±âÈ­"); self.btn_info = QPushButton("i")
+        self.btn_view_text.setStyleSheet(btn_style); self.btn_reset.setStyleSheet(btn_style)
+        self.btn_info.setFixedSize(30, 36)
+        self.btn_info.setStyleSheet(f"background:{COLOR_INFO_BTN}; border:1px solid #FBC02D; font-weight:bold; color:#5D4037; font-family:'Georgia'; font-size:18px; border-radius:4px;")
+        top_bar.addWidget(self.btn_view_text); top_bar.addWidget(self.btn_reset); top_bar.addWidget(self.btn_info)
+        layout.addLayout(top_bar)
+        
+        view_area = QHBoxLayout()
+        v1_box = QVBoxLayout(); v1_head = QHBoxLayout()
+        self.btn_z1_p = QPushButton("È®´ë ??+"); self.btn_z1_m = QPushButton("Ãà¼Ò ??-")
+        for b in [self.btn_z1_p, self.btn_z1_m]: b.setFixedSize(80, 24); b.setStyleSheet("font-size:11px; background:#f8f9fa; border:1px solid #ccc; border-radius:3px;")
+        self.lbl_name1 = QLabel("<b>[PDF 1]</b>")
+        v1_head.addWidget(self.btn_z1_p); v1_head.addWidget(self.btn_z1_m); v1_head.addWidget(self.lbl_name1); v1_head.addStretch()
+        v1_box.addLayout(v1_head); self.viewer1 = PDFViewer(); v1_box.addWidget(self.viewer1); view_area.addLayout(v1_box)
+        v2_box = QVBoxLayout(); v2_head = QHBoxLayout()
+        self.btn_z2_p = QPushButton("È®´ë ??+"); self.btn_z2_m = QPushButton("Ãà¼Ò ??-")
+        for b in [self.btn_z2_p, self.btn_z2_m]: b.setFixedSize(80, 24); b.setStyleSheet("font-size:11px; background:#f8f9fa; border:1px solid #ccc; border-radius:3px;")
+        self.lbl_name2 = QLabel("<b>[PDF 2]</b>")
+        v2_head.addWidget(self.btn_z2_p); v2_head.addWidget(self.btn_z2_m); v2_head.addWidget(self.lbl_name2); v2_head.addStretch()
+        v2_box.addLayout(v2_head); self.viewer2 = PDFViewer(); v2_box.addWidget(self.viewer2); view_area.addLayout(v2_box)
+        layout.addLayout(view_area)
+
+        guide_frame = QFrame(); guide_frame.setStyleSheet("background:#f9f9f9; border:1px solid #ddd; border-radius:6px;")
+        g_layout = QHBoxLayout(guide_frame); g_layout.setContentsMargins(15, 10, 15, 10)
+        
+        legend_html = (
+            f"<b>?? ÇÏÀÌ¶óÀÌÆ® ¹ü·Ê</b><br>"
+            f"<span style='color:{COLOR_P1.name()}; background:{COLOR_P1.name()};'>¡á</span> PDF1 »èÁ¦/º¯°æ (¿øº»¿¡¼­ »ç¶óÁø ¹®±¸)<br>"
+            f"<span style='color:{COLOR_P2.name()}; background:{COLOR_P2.name()};'>¡á</span> PDF2 Ãß°¡/º¯°æ (»õ·Î µé¾î¿Â ¹®±¸)<br>"
+            f"<span style='color:rgba(0,120,255,0.6);'>¡á</span> ÃÖ±Ù ºñ±³°¡ ÁøÇàµÈ ¿µ¿ª"
+        )
+        leg_label = QLabel(legend_html); leg_label.setStyleSheet("font-size:11px; line-height:1.6;"); g_layout.addWidget(leg_label, 1)
+        
+        caution_widget = QWidget(); caution_layout = QHBoxLayout(caution_widget); caution_layout.setContentsMargins(0,0,0,0)
+        col1 = QLabel(
+            "<b>?? ÁÖÀÇ</b><br>"
+            "1. º» ÇÁ·Î±×·¥Àº <b style='color:red; font-family:Malgun Gothic;'>ÇÑ±Û, ¿µ¹®, ¼ýÀÚ</b>¸¸À» Á¤±ÔÈ­ ´ëÁ¶ÇÕ´Ï´Ù.<br>"
+            "2. ¸ðµç °ø¹éÀ» Á¦°ÅÇÏ°í ºÐ¼®ÇÏ¹Ç·Î <b style='color:red; font-family:Malgun Gothic;'>¶ç¾î¾²±â ¿À·ù´Â °ËÁõµÇÁö ¾Ê½À´Ï´Ù.</b>"
+        )
+        col2 = QLabel(
+            "<br>" 
+            "3. Ç¥(Table) ÃßÃâ ½Ã ¼¿ ³»¿ëÀÌ ¼¯ÀÏ ¼ö ÀÖÀ¸¹Ç·Î ¹Ýµå½Ã <b style='color:red; font-family:Malgun Gothic;'>¼¿ ´ÜÀ§ µå·¡±×</b>¸¦ ±ÇÀåÇÕ´Ï´Ù.<br>"
+            "4. ±ä º¹ÇÕ¾î´Â ±¸Á¶ Â÷ÀÌ·Î <b style='color:red; font-family:Malgun Gothic;'>ÇÑÂÊ¸¸ ÇÏÀÌ¶óÀÌÆ®</b>µÉ ¼ö ÀÖÀ¸´Ï ´ëÁ¶°¡ ÇÊ¿äÇÕ´Ï´Ù."
+        )
+        for c in [col1, col2]: c.setStyleSheet("font-size:11px; color:#444; line-height:1.6;"); caution_layout.addWidget(c)
+        g_layout.addWidget(caution_widget, 3); layout.addWidget(guide_frame)
+
+        self.loading = LoadingOverlay(self); self.last_s1 = ""; self.last_s2 = ""
+        self.btn_load1.clicked.connect(self.load_p1); self.btn_load2.clicked.connect(self.load_p2)
+        self.btn_compare.clicked.connect(lambda: [self.loading.start_animation("ºñ±³ ºÐ¼® Áß..."), QTimer.singleShot(50, self.run_comparison)])
+        self.btn_reset.clicked.connect(lambda: [self.loading.start_animation("ºñ±³°á°ú ÃÊ±âÈ­ Áß...", faded_icon=True), QTimer.singleShot(800, self.reset_all)])
+        self.btn_view_text.clicked.connect(self.show_text_dialog); self.btn_info.clicked.connect(self.show_info)
+        self.btn_z1_p.clicked.connect(self.viewer1.zoom_in); self.btn_z1_m.clicked.connect(self.viewer1.zoom_out)
+        self.btn_z2_p.clicked.connect(self.viewer2.zoom_in); self.btn_z2_m.clicked.connect(self.viewer2.zoom_out)
+
+    def load_p1(self):
+        path, _ = QFileDialog.getOpenFileName(self, "PDF 1 ¿­±â", "", "PDF (*.pdf)")
+        if path:
+            self.viewer1.clear_all_data()
+            if self.viewer1.load_pdf(path): self.lbl_name1.setText(f"<b>[PDF 1] ?? {os.path.basename(path)}</b>")
+    def load_p2(self):
+        path, _ = QFileDialog.getOpenFileName(self, "PDF 2 ¿­±â", "", "PDF (*.pdf)")
+        if path:
+            self.viewer2.clear_all_data()
+            if self.viewer2.load_pdf(path): self.lbl_name2.setText(f"<b>[PDF 2] ?? {os.path.basename(path)}</b>")
+
+    def reset_all(self):
+        try: self.viewer1.clear_all_data(); self.viewer2.clear_all_data(); self.last_s1 = ""; self.last_s2 = ""
+        finally: self.loading.stop_animation()
+
+    def run_comparison(self):
+        try:
+            if not self.viewer1.char_data or not self.viewer2.char_data:
+                QMessageBox.warning(self, "°æ°í", "¾çÂÊ ºñ±³ ¿µ¿ªÀ» ¸ÕÀú µå·¡±×ÇØÁÖ¼¼¿ä."); return
+            self.viewer1.last_compared_area.clear(); self.viewer2.last_compared_area.clear()
+            for v in [self.viewer1, self.viewer2]:
+                if v.pending_selection_rect: p, r = v.pending_selection_rect; v.last_compared_area[p] = [r]
+            self.last_s1 = "".join([d['char'] for d in self.viewer1.char_data]); self.last_s2 = "".join([d['char'] for d in self.viewer2.char_data])
+            
+            # Use autojunk=False to prevent numbers being ignored as junk
+            matcher = SequenceMatcher(None, self.last_s1, self.last_s2, autojunk=False)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == 'equal': continue
+                if tag in ('delete', 'replace'):
+                    for idx in range(i1, i2): self.add_hl(self.viewer1, self.viewer1.char_data[idx], COLOR_P1)
+                if tag in ('insert', 'replace'):
+                    for idx in range(j1, j2): self.add_hl(self.viewer2, self.viewer2.char_data[idx], COLOR_P2)
+            for v in [self.viewer1, self.viewer2]:
+                for lbl in v.page_labels: lbl.clear_selection()
+                v.reload_pages()
+        finally: self.loading.stop_animation()
+
+    def show_info(self):
+        d = QDialog(self); d.setWindowTitle("Á¤º¸"); d.setFixedSize(420, 320)
+        l = QVBoxLayout(d); l.setContentsMargins(30, 30, 30, 30)
+        img_p = get_resource_path('posid_logo.png')
+        if os.path.exists(img_p):
+            img = QLabel(); img.setPixmap(QPixmap(img_p).scaled(200, 80, Qt.AspectRatioMode.KeepAspectRatio)); img.setAlignment(Qt.AlignmentFlag.AlignCenter); l.addWidget(img)
+        t = QLabel(f"<div style='text-align:center;'><h2 style='color:#004b93;'>PDF ÅØ½ºÆ® ºñ±³</h2><b>¹öÀü:</b> {VERSION}<br><b>¹èÆ÷ÀÏ:</b> {RELEASE_DATE}<br><br><b>Á¦ÀÛ:</b> {DEVELOPER}</div>"); l.addWidget(t)
+        btn = QPushButton("È®ÀÎ"); btn.setFixedHeight(35); btn.clicked.connect(d.accept); l.addStretch(); l.addWidget(btn); d.exec()
+
+    def show_text_dialog(self):
+        if not self.last_s1 and not self.last_s2: QMessageBox.information(self, "¾È³»", "ÃÖ±Ù ºñ±³ µ¥ÀÌÅÍ°¡ ¾ø½À´Ï´Ù."); return
+        ViewComparisonTextDialog(self.last_s1, self.last_s2, self).exec()
+
+    def add_hl(self, viewer, info, color):
+        p = info['page']
+        if p not in viewer.word_highlights: viewer.word_highlights[p] = []
+        if not any(h[0] == info['bbox'] and h[1] == color for h in viewer.word_highlights[p]):
+            viewer.word_highlights[p].append((info['bbox'], color))
+
+    def resizeEvent(self, event):
+        if self.loading.isVisible():
+            self.loading.setGeometry(self.rect())
+        super().resizeEvent(event)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv); app.setFont(QFont("Malgun Gothic", 9))
+    win = MainWindow(); win.show(); sys.exit(app.exec())

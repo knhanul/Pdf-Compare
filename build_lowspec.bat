@@ -53,7 +53,7 @@ if %ERRORLEVEL% EQU 0 (
     echo Build Complete!
     echo ========================================
     echo.
-    echo Executable location: dist\PDF_Compare_v%VERSION%.exe
+    echo Executable location: dist\InsPdfTxtCompare%VERSION%.exe
     echo.
     
     REM Display file information
